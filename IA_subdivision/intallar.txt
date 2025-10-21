@@ -1,0 +1,15 @@
+# Instalar Ollama
+curl -fsSL https://ollama.com/install.sh | sh
+
+# Descargar modelo
+ollama pull llama2
+
+# Arrancar servidor (en otra terminal)
+ollama serve
+
+
+Ejecutar Ollama
+python3 master_ollama.py
+
+Consultar decisión con IA
+curl http://localhost:5000/get_best_node_ollama?system_load=high

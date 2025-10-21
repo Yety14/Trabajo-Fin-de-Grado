@@ -1,13 +1,12 @@
-import json
 import time
 from datetime import datetime
 from flask import Flask, request, jsonify
-import threading
+import queue
 
 
 class MasterAgent:
     def __init__(self, weights=None):
-        # Ponderaciones configurables
+        # ... (tu código anterior de ponderaciones y config) ...
         self.weights = weights or {
             "cpu_availability": 0.30,
             "ram_availability": 0.25,
@@ -16,30 +15,86 @@ class MasterAgent:
             "historical_performance": 0.10
         }
 
-        # Validar que suman 1
-        total = sum(self.weights.values())
-        if abs(total - 1.0) > 0.01:
-            raise ValueError(f"Las ponderaciones deben sumar 1.0 (actual: {total})")
-
-        # Configuración de umbrales
         self.config = {
-            "temp_max": 85,  # Temperatura máxima antes de bloquear nodo
-            "temp_warning": 75,  # Temperatura de advertencia
-            "ram_critical": 95,  # RAM crítica, no asignar tareas
-            "cpu_critical": 95  # CPU crítica
+            "temp_max": 85,
+            "temp_warning": 75,
+            "ram_critical": 95,
+            "cpu_critical": 95
         }
 
-        # Consumo energético estimado por nodo (en watts)
         self.energy_consumption = {}
-
-        # Historial de rendimiento
         self.performance_history = {}
-
-        # Registro de decisiones para aprendizaje
         self.decision_log = []
-
-        # Datos actuales de los nodos (recibidos en tiempo real)
         self.nodes_data = {}
+
+        # NUEVO: Cola de tareas pendientes
+        self.task_queue = queue.Queue()
+        self.active_tasks = {}  # {task_id: {node_id, start_time, task_data}}
+        self.completed_tasks = []
+        self.task_id_counter = 0
+
+    def add_task(self, task_data):
+        """Añade una tarea a la cola"""
+        self.task_id_counter += 1
+        task = {
+            'task_id': self.task_id_counter,
+            'data': task_data,
+            'created_at': datetime.now().isoformat()
+        }
+        self.task_queue.put(task)
+        print(f"➕ Tarea {task['task_id']} añadida a la cola")
+        return task['task_id']
+
+    def get_next_task_for_node(self, node_id):
+        """Obtiene la siguiente tarea para un nodo específico"""
+        if self.task_queue.empty():
+            return None
+
+        try:
+            task = self.task_queue.get_nowait()
+            self.active_tasks[task['task_id']] = {
+                'node_id': node_id,
+                'start_time': time.time(),
+                'task_data': task
+            }
+            print(f"📤 Tarea {task['task_id']} asignada a {node_id}")
+            return task
+        except queue.Empty:
+            return None
+
+    def complete_task(self, task_id, node_id, result, success=True):
+        """Marca una tarea como completada"""
+        if task_id in self.active_tasks:
+            task_info = self.active_tasks[task_id]
+            elapsed_time = time.time() - task_info['start_time']
+
+            # Actualizar historial de rendimiento del nodo
+            self.update_performance(node_id, elapsed_time, success)
+
+            # Guardar resultado
+            self.completed_tasks.append({
+                'task_id': task_id,
+                'node_id': node_id,
+                'elapsed_time': elapsed_time,
+                'success': success,
+                'result': result,
+                'completed_at': datetime.now().isoformat()
+            })
+
+            del self.active_tasks[task_id]
+            print(f"✅ Tarea {task_id} completada por {node_id} en {elapsed_time:.2f}s")
+            return True
+        return False
+
+    def get_queue_status(self):
+        """Devuelve el estado de la cola de tareas"""
+        return {
+            'pending_tasks': self.task_queue.qsize(),
+            'active_tasks': len(self.active_tasks),
+            'completed_tasks': len(self.completed_tasks)
+        }
+
+    # ... (resto de métodos anteriores: calculate_node_score, etc.) ...
 
     def register_node(self, node_id, energy_watts=100):
         """Registra un nuevo nodo esclavo"""
@@ -51,35 +106,20 @@ class MasterAgent:
             "failures": 0,
             "success_rate": 1.0
         }
-        print(f"✅ Nodo {node_id} registrado con {energy_watts}W")
+        print(f"✅ Nodo {node_id} registrado")
 
     def update_node_data(self, node_id, node_data):
         """Actualiza los datos de un nodo esclavo"""
         self.nodes_data[node_id] = node_data
-
-        # Auto-registrar nodo si no existe
         if node_id not in self.energy_consumption:
             self.register_node(node_id)
 
     def calculate_node_score(self, node_id, node_data, system_load="normal"):
-        """
-        Calcula puntuación de un nodo basado en métricas y ponderaciones
-
-        Args:
-            node_id: ID del nodo
-            node_data: Diccionario con métricas del nodo
-            system_load: "low", "normal", "high" - ajusta prioridades dinámicamente
-
-        Returns:
-            float: Puntuación entre 0 y 1 (mayor es mejor)
-        """
-
-        # Extraer datos
+        """Calcula puntuación del nodo"""
         cpu_percent = node_data.get("cpu_percent", 100)
         ram_percent = node_data.get("ram_percent", 100)
         cpu_temp = node_data.get("cpu_temp", None)
 
-        # Si temperatura o recursos críticos, retornar 0
         if cpu_temp and cpu_temp > self.config["temp_max"]:
             return 0.0
         if ram_percent > self.config["ram_critical"]:
@@ -87,47 +127,33 @@ class MasterAgent:
         if cpu_percent > self.config["cpu_critical"]:
             return 0.0
 
-        # === CALCULAR SCORES INDIVIDUALES (0 a 1) ===
-
-        # 1. CPU disponible (invertido)
         score_cpu = (100 - cpu_percent) / 100
-
-        # 2. RAM disponible (invertido)
         score_ram = (100 - ram_percent) / 100
 
-        # 3. Temperatura (normalizado, menor es mejor)
         if cpu_temp is not None:
             score_temp = max(0, (self.config["temp_max"] - cpu_temp) / self.config["temp_max"])
         else:
-            score_temp = 0.5  # Valor neutro si no hay temperatura
+            score_temp = 0.5
 
-        # 4. Eficiencia energética (normalizado)
         node_energy = self.energy_consumption.get(node_id, 100)
         max_energy = max(self.energy_consumption.values()) if self.energy_consumption else 100
         score_energy = 1 - (node_energy / max_energy)
 
-        # 5. Rendimiento histórico
         perf = self.performance_history.get(node_id, {"success_rate": 0.5})
         score_history = perf["success_rate"]
 
-        # === AJUSTE DINÁMICO DE PESOS SEGÚN CARGA DEL SISTEMA ===
         weights = self.weights.copy()
-
         if system_load == "low":
-            # Con poca carga, priorizar eficiencia energética
             weights["energy_efficiency"] *= 1.5
             weights["cpu_availability"] *= 0.7
         elif system_load == "high":
-            # Con mucha carga, priorizar disponibilidad y temperatura
             weights["cpu_availability"] *= 1.3
             weights["temperature"] *= 1.3
             weights["energy_efficiency"] *= 0.5
 
-        # Renormalizar pesos
         total_weight = sum(weights.values())
         weights = {k: v / total_weight for k, v in weights.items()}
 
-        # === CALCULAR SCORE FINAL PONDERADO ===
         final_score = (
                 score_cpu * weights["cpu_availability"] +
                 score_ram * weights["ram_availability"] +
@@ -135,50 +161,10 @@ class MasterAgent:
                 score_energy * weights["energy_efficiency"] +
                 score_history * weights["historical_performance"]
         )
-
         return final_score
 
-    def select_best_node(self, system_load="normal"):
-        """
-        Selecciona el mejor nodo para asignar una tarea usando datos en tiempo real
-
-        Args:
-            system_load: nivel de carga del sistema
-
-        Returns:
-            tuple: (node_id, score, scores_detail)
-        """
-        if not self.nodes_data:
-            return None, 0, {}
-
-        best_node = None
-        best_score = -1
-        scores_detail = {}
-
-        for node_id, data in self.nodes_data.items():
-            score = self.calculate_node_score(node_id, data, system_load)
-            scores_detail[node_id] = score
-
-            if score > best_score:
-                best_score = score
-                best_node = node_id
-
-        # Registrar decisión
-        self.decision_log.append({
-            "timestamp": datetime.now().isoformat(),
-            "selected_node": best_node,
-            "score": best_score,
-            "all_scores": scores_detail,
-            "system_load": system_load
-        })
-
-        return best_node, best_score, scores_detail
-
     def update_performance(self, node_id, task_time, success=True):
-        """
-        Actualiza el historial de rendimiento tras completar una tarea
-        Aquí es donde la IA "aprende"
-        """
+        """Actualiza el historial de rendimiento"""
         if node_id not in self.performance_history:
             self.register_node(node_id)
 
@@ -191,71 +177,18 @@ class MasterAgent:
         else:
             perf["failures"] += 1
 
-        # Calcular tasa de éxito
         total_tasks = perf["tasks_completed"] + perf["failures"]
         perf["success_rate"] = perf["tasks_completed"] / total_tasks if total_tasks > 0 else 0.5
 
-    def adjust_weights_from_history(self):
-        """
-        Ajusta automáticamente las ponderaciones basándose en el historial
-        (Aprendizaje simple - puedes mejorarlo con ML real)
-        """
-        # Analizar últimas 100 decisiones
-        recent_decisions = self.decision_log[-100:]
 
-        if len(recent_decisions) < 10:
-            return  # Necesita más datos
-
-        print("⚙️ Ajustando ponderaciones basado en historial...")
-        # Placeholder para lógica de aprendizaje avanzada
-
-    def get_status_report(self):
-        """Genera reporte del estado de todos los nodos"""
-        report = {
-            "timestamp": datetime.now().isoformat(),
-            "total_nodes": len(self.nodes_data),
-            "nodes": {}
-        }
-
-        for node_id, data in self.nodes_data.items():
-            score = self.calculate_node_score(node_id, data)
-            perf = self.performance_history.get(node_id, {})
-
-            report["nodes"][node_id] = {
-                "metrics": data,
-                "score": round(score, 3),
-                "performance": perf
-            }
-
-        return report
-
-
-# === FUNCIONES DE CONFIGURACIÓN ===
-
-def load_weights_from_file(filename="weights_config.json"):
-    """Carga ponderaciones desde archivo JSON"""
-    try:
-        with open(filename, 'r') as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return None
-
-
-def save_weights_to_file(weights, filename="weights_config.json"):
-    """Guarda ponderaciones en archivo JSON"""
-    with open(filename, 'w') as f:
-        json.dump(weights, f, indent=4)
-
-
-# === SERVIDOR FLASK INTEGRADO ===
+# === SERVIDOR FLASK ===
 
 app = Flask(__name__)
-master = None  # Se inicializará en main
+master = None
 
 
 @app.route('/register', methods=['POST'])
 def register_node():
-    """Endpoint para registrar un nuevo nodo"""
     data = request.get_json()
     node_id = data.get('node_id')
     energy_watts = data.get('energy_watts', 100)
@@ -269,11 +202,9 @@ def register_node():
 
 @app.route('/update_metrics', methods=['POST'])
 def update_metrics():
-    """Endpoint para recibir métricas de los nodos esclavos"""
     data = request.get_json()
-    node_id = data.get('node_id') or request.remote_addr  # Usar IP si no hay ID
+    node_id = data.get('node_id') or request.remote_addr
 
-    # Extraer métricas
     metrics = {
         "cpu_cores": data.get("cpu_cores"),
         "cpu_percent": data.get("cpu_percent"),
@@ -283,74 +214,90 @@ def update_metrics():
     }
 
     master.update_node_data(node_id, metrics)
-
-    return jsonify({
-        "status": "updated",
-        "node_id": node_id,
-        "timestamp": datetime.now().isoformat()
-    }), 200
+    return jsonify({"status": "updated", "node_id": node_id}), 200
 
 
-@app.route('/get_best_node', methods=['GET'])
-def get_best_node():
-    """Endpoint para obtener el mejor nodo disponible"""
-    system_load = request.args.get('system_load', 'normal')
+@app.route('/request_task', methods=['POST'])
+def request_task():
+    """Endpoint para que un esclavo pida una tarea"""
+    data = request.get_json()
+    node_id = data.get('node_id') or request.remote_addr
 
-    best_node, score, all_scores = master.select_best_node(system_load)
+    # Verificar que el nodo esté en buen estado
+    if node_id in master.nodes_data:
+        score = master.calculate_node_score(node_id, master.nodes_data[node_id])
+        if score < 0.3:  # Umbral mínimo
+            return jsonify({
+                "status": "rejected",
+                "reason": "Node score too low",
+                "score": score
+            }), 200
 
-    return jsonify({
-        "best_node": best_node,
-        "score": round(score, 3),
-        "all_scores": {k: round(v, 3) for k, v in all_scores.items()},
-        "timestamp": datetime.now().isoformat()
-    }), 200
+    # Obtener siguiente tarea
+    task = master.get_next_task_for_node(node_id)
+
+    if task:
+        return jsonify({
+            "status": "task_assigned",
+            "task": task
+        }), 200
+    else:
+        return jsonify({
+            "status": "no_tasks",
+            "message": "No hay tareas pendientes"
+        }), 200
+
+
+@app.route('/complete_task', methods=['POST'])
+def complete_task():
+    """Endpoint para reportar tarea completada"""
+    data = request.get_json()
+    task_id = data.get('task_id')
+    node_id = data.get('node_id')
+    result = data.get('result')
+    success = data.get('success', True)
+
+    if not task_id or not node_id:
+        return jsonify({"error": "task_id y node_id requeridos"}), 400
+
+    if master.complete_task(task_id, node_id, result, success):
+        return jsonify({"status": "completed"}), 200
+    else:
+        return jsonify({"error": "Task not found"}), 404
+
+
+@app.route('/add_task', methods=['POST'])
+def add_task():
+    """Endpoint para añadir tareas a la cola (para testing o cliente externo)"""
+    data = request.get_json()
+    task_data = data.get('task_data')
+
+    if not task_data:
+        return jsonify({"error": "task_data requerido"}), 400
+
+    task_id = master.add_task(task_data)
+    return jsonify({"status": "task_added", "task_id": task_id}), 200
+
+
+@app.route('/queue_status', methods=['GET'])
+def queue_status():
+    """Endpoint para ver el estado de la cola"""
+    return jsonify(master.get_queue_status()), 200
 
 
 @app.route('/status', methods=['GET'])
 def get_status():
-    """Endpoint para obtener el estado completo del clúster"""
-    return jsonify(master.get_status_report()), 200
+    """Estado completo del clúster"""
+    status = {
+        'nodes': master.nodes_data,
+        'queue': master.get_queue_status(),
+        'active_tasks': master.active_tasks,
+        'timestamp': datetime.now().isoformat()
+    }
+    return jsonify(status), 200
 
-
-@app.route('/update_performance', methods=['POST'])
-def update_performance():
-    """Endpoint para actualizar el rendimiento tras completar una tarea"""
-    data = request.get_json()
-    node_id = data.get('node_id')
-    task_time = data.get('task_time')
-    success = data.get('success', True)
-
-    if not node_id or task_time is None:
-        return jsonify({"error": "node_id y task_time requeridos"}), 400
-
-    master.update_performance(node_id, task_time, success)
-
-    return jsonify({"status": "performance_updated", "node_id": node_id}), 200
-
-
-def monitor_loop():
-    """Loop de monitorización que imprime el estado cada X segundos"""
-    while True:
-        time.sleep(30)  # Cada 30 segundos
-        if master.nodes_data:
-            print("\n" + "=" * 60)
-            print(f"📊 ESTADO DEL CLÚSTER - {datetime.now().strftime('%H:%M:%S')}")
-            print("=" * 60)
-
-            for node_id, data in master.nodes_data.items():
-                score = master.calculate_node_score(node_id, data)
-                temp = data.get('cpu_temp', 'N/A')
-                print(f"\n🖥️  {node_id}:")
-                print(f"   CPU: {data.get('cpu_percent', 0):.1f}% | RAM: {data.get('ram_percent', 0):.1f}%")
-                print(f"   Temp: {temp}°C | Score: {score:.3f}")
-
-            print("\n" + "=" * 60)
-
-
-# === EJEMPLO DE USO ===
 
 if __name__ == "__main__":
-    # Crear agente maestro con ponderaciones personalizadas
     custom_weights = {
         "cpu_availability": 0.35,
         "ram_availability": 0.30,
@@ -361,29 +308,16 @@ if __name__ == "__main__":
 
     master = MasterAgent(weights=custom_weights)
 
-    # Cargar ponderaciones desde archivo si existe
-    saved_weights = load_weights_from_file()
-    if saved_weights:
-        master.weights = saved_weights
-        print("✅ Ponderaciones cargadas desde archivo")
+    # Añadir algunas tareas de ejemplo
+    master.add_task({"type": "train_model", "epochs": 10})
+    master.add_task({"type": "process_data", "file": "data1.csv"})
+    master.add_task({"type": "simulation", "params": {"x": 100}})
 
-    # Registrar nodos predefinidos (opcional)
-    master.register_node("node_1", energy_watts=120)
-    master.register_node("node_2", energy_watts=80)
-    master.register_node("node_3", energy_watts=150)
+    print("\n🚀 Servidor maestro con cola de tareas iniciado")
+    print("📡 Endpoints:")
+    print("   - POST /request_task    : Pedir tarea")
+    print("   - POST /complete_task   : Reportar tarea completada")
+    print("   - POST /add_task        : Añadir tarea a la cola")
+    print("   - GET  /queue_status    : Ver estado de la cola\n")
 
-    # Iniciar thread de monitorización
-    monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
-    monitor_thread.start()
-
-    print("\n🚀 Servidor maestro iniciado")
-    print("📡 Esperando conexiones de nodos esclavos...")
-    print(f"🌐 Endpoints disponibles:")
-    print(f"   - POST /register          : Registrar nodo")
-    print(f"   - POST /update_metrics    : Actualizar métricas")
-    print(f"   - GET  /get_best_node     : Obtener mejor nodo")
-    print(f"   - GET  /status            : Estado del clúster")
-    print(f"   - POST /update_performance: Actualizar rendimiento\n")
-
-    # Iniciar servidor Flask
     app.run(host='0.0.0.0', port=5000, debug=False)
