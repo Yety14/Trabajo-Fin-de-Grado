@@ -72,7 +72,7 @@ def send_metrics():
 def request_task():
     """Pide una tarea al maestro"""
     try:
-        url = f"http://{MASTER_IP}:{MASTER_PORT}/request_task"
+        url = f"http://{MASTER_IP}:{MASTER_PORT}/request_task_ollama"
         data = {"node_id": NODE_ID}
         response = requests.post(url, json=data, timeout=5)
 
