@@ -1,9 +1,11 @@
 from flask import request, jsonify
-from agente import MasterAgent, app
-from datetime import datetime
+from datetime import datetime  # ✅ CORREGIDO
 import requests
+from agente import MasterAgent, app
 
+# ✅ Definir master como global
 master = None
+
 
 class MasterAgentWithOllama(MasterAgent):
     def __init__(self, weights=None, use_ollama=True, ollama_model='llama2'):
@@ -57,8 +59,11 @@ class MasterAgentWithOllama(MasterAgent):
                     return recommended_node, scores_detail[recommended_node], scores_detail
 
         # 3. Fallback: usar el mejor score tradicional
-        best_node = max(scores_detail, key=scores_detail.get)
-        return best_node, scores_detail[best_node], scores_detail
+        if scores_detail:  # ✅ Verificar que no esté vacío
+            best_node = max(scores_detail, key=scores_detail.get)
+            return best_node, scores_detail[best_node], scores_detail
+        else:
+            return None, 0, {}
 
     def _build_ollama_prompt(self, scores_detail, system_load):
         """Construye el prompt para Ollama con los datos de los nodos"""
@@ -111,11 +116,18 @@ Tu respuesta:"""
         return None
 
 
-# === ACTUALIZAR ENDPOINT FLASK ===
+# === ENDPOINTS FLASK (solo si no existen en agente.py) ===
 
-@app.route('/request_task', methods=['POST'])
-def request_task():
+# ✅ Solo definir si agente.py NO tiene este endpoint
+# Si ya existe, comenta o elimina esta función
+@app.route('/request_task_ollama', methods=['POST'])  # ✅ Cambiado el nombre para evitar conflicto
+def request_task_ollama():
     """Endpoint para que un esclavo pida una tarea (con Ollama)"""
+    global master  # ✅ Declarar como global
+
+    if master is None:
+        return jsonify({"error": "Master no inicializado"}), 500
+
     data = request.get_json()
     node_id = data.get('node_id') or request.remote_addr
 
@@ -147,6 +159,11 @@ def request_task():
 @app.route('/get_best_node_ollama', methods=['GET'])
 def get_best_node_ollama():
     """Endpoint para consultar el mejor nodo usando Ollama"""
+    global master  # ✅ Declarar como global
+
+    if master is None:
+        return jsonify({"error": "Master no inicializado"}), 500
+
     system_load = request.args.get('system_load', 'normal')
 
     if hasattr(master, 'select_best_node_with_ollama'):
@@ -156,14 +173,14 @@ def get_best_node_ollama():
 
     return jsonify({
         "best_node": best_node,
-        "score": round(score, 3),
+        "score": round(score, 3) if score else 0,
         "all_scores": {k: round(v, 3) for k, v in all_scores.items()},
         "method": "ollama+scoring",
-        "timestamp": datetime.now().isoformat()
+        "timestamp": datetime.now().isoformat()  # ✅ Ahora funcionará
     }), 200
 
 
-# === EJEMPLO DE USO ===
+# === INICIALIZACIÓN ===
 
 if __name__ == "__main__":
     custom_weights = {
@@ -174,8 +191,12 @@ if __name__ == "__main__":
         "historical_performance": 0.05
     }
 
-    # Usar la versión con Ollama
-    master = MasterAgentWithOllama(weights=custom_weights, use_ollama=True, ollama_model='llama2')
+    # ✅ Asignar a la variable global
+    master = MasterAgentWithOllama(
+        weights=custom_weights,
+        use_ollama=True,
+        ollama_model='llama2'
+    )
 
     # Añadir tareas de ejemplo
     master.add_task({"type": "train_model", "epochs": 10})
@@ -183,7 +204,8 @@ if __name__ == "__main__":
 
     print("\n🚀 Servidor maestro con Ollama iniciado")
     print("🤖 Modelo: llama2")
-    print("📡 Nuevos endpoints:")
-    print("   - GET /get_best_node_ollama : Consultar mejor nodo con IA\n")
+    print("📡 Endpoints disponibles:")
+    print("   - POST /request_task_ollama    : Pedir tarea (versión Ollama)")
+    print("   - GET  /get_best_node_ollama   : Consultar mejor nodo con IA\n")
 
     app.run(host='0.0.0.0', port=5000, debug=False)
